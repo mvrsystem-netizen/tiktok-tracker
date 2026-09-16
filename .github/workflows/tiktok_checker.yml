@@ -1,0 +1,38 @@
+name: TikTok Live Activity Background Checker
+
+on:
+  schedule:
+    # Berjalan otomatis setiap 10 menit (gratis tanpa henti di GitHub Actions)
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Tombol manual trigger di tab Actions GitHub
+
+jobs:
+  check-tiktok-activity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run TikTok Activity Checker
+        env:
+          # Disimpan aman di GitHub Repository Secrets (Settings -> Secrets and variables -> Actions)
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python checker.py
