@@ -2,8 +2,8 @@ name: TikTok Live Activity Background Checker
 
 on:
   schedule:
-    # Berjalan otomatis setiap 10 menit (gratis tanpa henti di GitHub Actions)
-    - cron: '*/10 * * * *'
+    # Berjalan otomatis setiap 5 menit (gratis tanpa henti di GitHub Actions)
+    - cron: '*/5 * * * *'
   workflow_dispatch: # Tombol manual trigger di tab Actions GitHub
 
 jobs:
