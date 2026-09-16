@@ -23,9 +23,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TikTokChecker")
 
-# Kredensial Environment dari GitHub Secrets
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Kredensial Environment dari GitHub Secrets atau Default
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://kxdiqgjeqjrlvxwscavy.supabase.co")
+SUPABASE_KEY = os.getenv(
+    "SUPABASE_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt4ZGlxZ2plcWpybHZ4d3NjYXZ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk1NzUwMzIsImV4cCI6MjEwNTE1MTAzMn0.DeYH7w_fx9XQIpTx5IJccJBFKPOmlccloWbscpuD1eU"
+)
 NTFY_TOPIC = os.getenv("NTFY_TOPIC") # Layanan notifikasi push mobile 100% gratis via ntfy.sh
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -77,22 +80,26 @@ def send_free_push_notification(title: str, message: str, tags: Optional[List[st
 def get_live_room_data(username: str) -> Optional[Dict]:
     """
     Memeriksa status live room host di TikTok melalui endpoint API webcast publik.
-    Mengembalikan dictionary data room jika sedang live, atau None jika offline.
+    Mengembalikan dictionary data room jika sedang live aktif (status == 2), atau None jika offline.
     """
-    clean_username = username.strip().lstrip("@")
-    endpoint = f"https://www.tiktok.com/api-live/user/room/?aid=1988&uniqueId={clean_username}"
+    clean_username = username.strip().lstrip("@").lower()
+    # Parameter sourceType=54 dan aid=1988 wajib ada agar TikTok tidak mengembalikan params_error
+    endpoint = f"https://www.tiktok.com/api-live/user/room/?aid=1988&sourceType=54&uniqueId={clean_username}"
 
     try:
         response = requests.get(endpoint, headers=HTTP_HEADERS, timeout=10)
         if response.status_code == 200:
             res_json = response.json()
-            data = res_json.get("data", {})
-            live_room = data.get("liveRoom", {})
+            data = res_json.get("data") or {}
+            live_room = data.get("liveRoom") or {}
             status = live_room.get("status")
             
             # Status 2 menandakan room sedang LIVE aktif
             if status == 2:
                 return live_room
+            # Status 4 atau lainnya menandakan offline / siaran telah selesai
+            if status == 4:
+                return None
     except Exception as exc:
         logger.debug("Fetch live error untuk @%s: %s", clean_username, str(exc))
 
@@ -100,8 +107,10 @@ def get_live_room_data(username: str) -> Optional[Dict]:
     try:
         web_url = f"https://www.tiktok.com/@{clean_username}/live"
         web_res = requests.get(web_url, headers=HTTP_HEADERS, timeout=8, allow_redirects=True)
-        if web_res.status_code == 200 and ("room_id" in web_res.text or "SIGI_STATE" in web_res.text):
-            if '"status":2' in web_res.text or '"liveRoom"' in web_res.text:
+        if web_res.status_code == 200:
+            # HANYA anggap live jika benar-benar ada tanda live aktif (status 2).
+            # JANGAN cek string 'liveRoom' karena teks tersebut selalu ada di semua halaman profil TikTok.
+            if '"status":2' in web_res.text:
                 return {"live": True, "owner": clean_username}
     except Exception:
         pass
@@ -284,6 +293,21 @@ def run_checker():
         logger.info("Berhasil menyimpan %d log aktivitas baru ke Supabase.", len(new_logs_to_insert))
     else:
         logger.info("Tidak ada perubahan status pada target. Database tetap teratur.")
+
+    # 5. Update bot heartbeat untuk status koneksi di APK
+    try:
+        heartbeat_payload = {
+            "id": "checker_worker",
+            "last_ping": datetime.now(timezone.utc).isoformat(),
+            "status": "ACTIVE",
+            "targets_checked": len(targets),
+            "hosts_checked": len(hosts),
+            "details": f"Checked {len(targets)} targets and {len(hosts)} hosts at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        }
+        supabase.table("bot_heartbeat").upsert(heartbeat_payload).execute()
+        logger.info("Heartbeat bot berhasil diperbarui ke Supabase.")
+    except Exception as hb_err:
+        logger.debug("Heartbeat optional info (tabel bot_heartbeat belum dibuat): %s", str(hb_err))
 
     logger.info("Pengecekan selesai.")
 
