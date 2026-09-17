@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
 TikTok Activity Tracker - Background Checker
-Production-ready background worker for GitHub Actions.
-Checks host live rooms and tracks target user statuses (OFFLINE, LIVE_HOST, TAMU, PENONTON)
-then stores structured logs to Supabase and broadcasts free push notifications.
+Production-ready background worker for GitHub Actions & standalone server.
+Zero-dependency implementation: runs on any standard Python 3.8+ environment without requiring pip.
+Accurately detects:
+- LIVE_HOST: Target broadcasting live on TikTok
+- TAMU: Target joined as guest/co-host on active live room
+- PENONTON: Target watching active live room
+- OFFLINE: Target not active
 """
 
 import os
 import sys
 import json
+import re
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Set
-import requests
-from supabase import create_client, Client
 
 # Konfigurasi Logging Ringkas & Bersih
 logging.basicConfig(
@@ -24,45 +31,88 @@ logging.basicConfig(
 logger = logging.getLogger("TikTokChecker")
 
 # Kredensial Environment dari GitHub Secrets atau Default
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://kxdiqgjeqjrlvxwscavy.supabase.co")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://kxdiqgjeqjrlvxwscavy.supabase.co").rstrip("/")
 SUPABASE_KEY = os.getenv(
     "SUPABASE_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt4ZGlxZ2plcWpybHZ4d3NjYXZ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk1NzUwMzIsImV4cCI6MjEwNTE1MTAzMn0.DeYH7w_fx9XQIpTx5IJccJBFKPOmlccloWbscpuD1eU"
 )
-NTFY_TOPIC = os.getenv("NTFY_TOPIC") # Layanan notifikasi push mobile 100% gratis via ntfy.sh
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("Error: SUPABASE_URL dan SUPABASE_KEY harus disetel di Environment Variables / GitHub Secrets.")
+    logger.error("Error: SUPABASE_URL dan SUPABASE_KEY harus disetel.")
     sys.exit(1)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-}
+class SupabaseRestClient:
+    """Klien REST Supabase mandiri berbasis urllib tanpa dependensi eksternal."""
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url
+        self.headers = {
+            "apikey": api_key,
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+    def get(self, endpoint: str) -> List[Dict]:
+        url = f"{self.base_url}/rest/v1/{endpoint}"
+        req = urllib.request.Request(url, headers=self.headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except Exception as e:
+            logger.debug("Supabase GET %s error: %s", endpoint, e)
+            return []
+
+    def post(self, endpoint: str, data: List[Dict], upsert: bool = False) -> bool:
+        url = f"{self.base_url}/rest/v1/{endpoint}"
+        headers = dict(self.headers)
+        if upsert:
+            headers["Prefer"] = "resolution=merge-duplicates"
+        req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return res.status in (200, 201)
+        except Exception as e:
+            logger.debug("Supabase POST %s error: %s", endpoint, e)
+            return False
+
+    def patch(self, endpoint: str, data: Dict) -> bool:
+        url = f"{self.base_url}/rest/v1/{endpoint}"
+        req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=self.headers, method="PATCH")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return res.status in (200, 204)
+        except Exception as e:
+            logger.debug("Supabase PATCH %s error: %s", endpoint, e)
+            return False
+
+
+supabase = SupabaseRestClient(SUPABASE_URL, SUPABASE_KEY)
 
 
 def send_free_push_notification(title: str, message: str, tags: Optional[List[str]] = None) -> None:
     """Mengirim push notification gratis ke HP pengguna via ntfy.sh dan/atau Telegram."""
-    # 1. Notifikasi ntfy.sh (Aplikasi gratis di Play Store tanpa perlu login/bayar)
     if NTFY_TOPIC:
         try:
             url = f"https://ntfy.sh/{NTFY_TOPIC}"
-            headers = {
-                "Title": title.encode("utf-8"),
-                "Priority": "high",
-                "Tags": ",".join(tags or ["rotating_light", "tiktok"]),
-            }
-            requests.post(url, data=message.encode("utf-8"), headers=headers, timeout=5)
-            logger.info("Notifikasi ntfy.sh berhasil terkirim.")
+            req = urllib.request.Request(
+                url,
+                data=message.encode("utf-8"),
+                headers={
+                    "Title": title.encode("utf-8"),
+                    "Priority": "high",
+                    "Tags": ",".join(tags or ["rotating_light", "tiktok"]),
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5) as res:
+                if res.status == 200:
+                    logger.info("Notifikasi ntfy.sh berhasil terkirim.")
         except Exception as e:
             logger.warning("Gagal mengirim ntfy: %s", str(e))
 
-    # 2. Notifikasi Telegram Bot (Gratis tanpa batas)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
             tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -71,57 +121,114 @@ def send_free_push_notification(title: str, message: str, tags: Optional[List[st
                 "text": f"*{title}*\n{message}",
                 "parse_mode": "Markdown"
             }
-            requests.post(tg_url, json=payload, timeout=5)
-            logger.info("Notifikasi Telegram berhasil terkirim.")
+            req = urllib.request.Request(
+                tg_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5) as res:
+                if res.status == 200:
+                    logger.info("Notifikasi Telegram berhasil terkirim.")
         except Exception as e:
             logger.warning("Gagal mengirim Telegram: %s", str(e))
 
 
 def get_live_room_data(username: str) -> Optional[Dict]:
     """
-    Memeriksa status live room host di TikTok melalui endpoint API webcast publik.
-    Mengembalikan dictionary data room jika sedang live aktif (status == 2), atau None jika offline.
+    Memeriksa status siaran live pengguna di TikTok secara akurat.
+    Menggunakan multi-metode:
+    1. Endpoint Webcast API resmi dengan header Referer & User-Agent valid
+    2. Fallback parsing SIGI_STATE HTML untuk melewati bot detection
+    Mengembalikan dict data room dan profil jika ditemukan, atau None.
     """
     clean_username = username.strip().lstrip("@").lower()
-    # Parameter sourceType=54 dan aid=1988 wajib ada agar TikTok tidak mengembalikan params_error
+    live_page_url = f"https://www.tiktok.com/@{clean_username}/live"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": live_page_url,
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+    }
+
+    # Metode 1: api-live dengan header Referer yang tepat
     endpoint = f"https://www.tiktok.com/api-live/user/room/?aid=1988&sourceType=54&uniqueId={clean_username}"
-
     try:
-        response = requests.get(endpoint, headers=HTTP_HEADERS, timeout=10)
-        if response.status_code == 200:
-            res_json = response.json()
-            data = res_json.get("data") or {}
-            live_room = data.get("liveRoom") or {}
-            status = live_room.get("status")
-            
-            # Status 2 menandakan room sedang LIVE aktif
-            if status == 2:
-                return live_room
-            # Status 4 atau lainnya menandakan offline / siaran telah selesai
-            if status == 4:
-                return None
+        req = urllib.request.Request(endpoint, headers=headers)
+        with urllib.request.urlopen(req, timeout=6) as response:
+            if response.status == 200:
+                res_json = json.loads(response.read().decode("utf-8"))
+                data = res_json.get("data") or {}
+                live_room = data.get("liveRoom") or {}
+                user = data.get("user") or {}
+                status = live_room.get("status")
+
+                if status is not None:
+                    is_live = (status == 2)
+                    raw_text = json.dumps(res_json)
+                    room_id = user.get("roomId") or user.get("room_id") or live_room.get("roomId") or live_room.get("room_id") or ""
+                    if not room_id and is_live:
+                        m_room = re.search(r'"room_?id"[:\s]*"?(\d{15,25})"?', raw_text, re.IGNORECASE)
+                        if m_room:
+                            room_id = m_room.group(1)
+                    return {
+                        "is_live": is_live,
+                        "status": status,
+                        "room_id": str(room_id) if room_id else "",
+                        "nickname": user.get("nickname", ""),
+                        "avatar": user.get("avatarMedium") or user.get("avatarThumb"),
+                        "title": live_room.get("title", "")
+                    }
     except Exception as exc:
-        logger.debug("Fetch live error untuk @%s: %s", clean_username, str(exc))
+        logger.debug("api-live error untuk @%s: %s", clean_username, str(exc))
 
-    # Fallback: Periksa via HTML page live
+    # Metode 2: Fallback scraping HTML SIGI_STATE dengan Referer
     try:
-        web_url = f"https://www.tiktok.com/@{clean_username}/live"
-        web_res = requests.get(web_url, headers=HTTP_HEADERS, timeout=8, allow_redirects=True)
-        if web_res.status_code == 200:
-            # HANYA anggap live jika benar-benar ada tanda live aktif (status 2).
-            # JANGAN cek string 'liveRoom' karena teks tersebut selalu ada di semua halaman profil TikTok.
-            if '"status":2' in web_res.text:
-                return {"live": True, "owner": clean_username}
-    except Exception:
-        pass
+        html_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.tiktok.com/",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+        }
+        html_req = urllib.request.Request(live_page_url, headers=html_headers)
+        with urllib.request.urlopen(html_req, timeout=7) as web_res:
+            if web_res.status == 200:
+                html = web_res.read().decode("utf-8", errors="ignore")
+                m = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', html, re.DOTALL)
+                if m:
+                    sigi = json.loads(m.group(1))
+                    live_user_info = sigi.get("LiveRoom", {}).get("liveRoomUserInfo", {})
+                    user = live_user_info.get("user", {})
+                    live_room = live_user_info.get("liveRoom", {})
+                    status = live_room.get("status") or user.get("status")
+
+                    room_id = user.get("roomId") or live_room.get("roomId") or ""
+                    if not room_id:
+                        m_rid = re.search(r'"room_?id"[:\s]*"?(\d{15,25})"?', html, re.IGNORECASE)
+                        if m_rid:
+                            room_id = m_rid.group(1)
+
+                    if status is not None:
+                        return {
+                            "is_live": (status == 2),
+                            "status": status,
+                            "room_id": str(room_id) if room_id else "",
+                            "nickname": user.get("nickname", ""),
+                            "avatar": user.get("avatarMedium") or user.get("avatarThumb"),
+                            "title": live_room.get("title", "")
+                        }
+    except Exception as exc:
+        logger.debug("HTML SIGI fallback error untuk @%s: %s", clean_username, str(exc))
 
     return None
 
 
-def fetch_room_participants(room_id: str, anchor_id: str) -> Tuple[Set[str], Set[str]]:
+def fetch_room_participants(room_id: str, host_username: str) -> Tuple[Set[str], Set[str]]:
     """
-    Mengambil daftar co-host/guest (TAMU) dan penonton (PENONTON) di dalam live room.
-    Mengembalikan (set_tamu, set_penonton).
+    Mengambil daftar co-host/guest (TAMU) dan penonton (PENONTON) di dalam live room
+    menggunakan endpoint resmi webcast/room/info TikTok.
+    Mengembalikan (set_tamu, set_penonton) dalam huruf kecil.
     """
     guests: Set[str] = set()
     viewers: Set[str] = set()
@@ -129,58 +236,57 @@ def fetch_room_participants(room_id: str, anchor_id: str) -> Tuple[Set[str], Set
     if not room_id:
         return guests, viewers
 
-    # 1. Cek Komal / Link-Mic / Co-Host
     try:
-        cohost_url = f"https://webcast.tiktok.com/webcast/linkmic/user_list/?room_id={room_id}&aid=1988"
-        res = requests.get(cohost_url, headers=HTTP_HEADERS, timeout=5)
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            user_list = data.get("users", []) or data.get("linkmic_users", [])
-            for u in user_list:
-                uname = u.get("display_id") or u.get("unique_id") or u.get("nickname")
-                if uname:
-                    guests.add(str(uname).lower().strip().lstrip("@"))
-    except Exception:
-        pass
+        url = f"https://webcast.tiktok.com/webcast/room/info/?room_id={room_id}&aid=1988"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Referer": f"https://www.tiktok.com/@{host_username}/live",
+            "Accept": "application/json, text/plain, */*",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=6) as res:
+            if res.status == 200:
+                data = json.loads(res.read().decode("utf-8")).get("data", {})
 
-    # 2. Cek Penonton / Audience Rank List
-    try:
-        rank_url = f"https://webcast.tiktok.com/webcast/ranklist/audience/?room_id={room_id}&anchor_id={anchor_id}&aid=1988"
-        res = requests.get(rank_url, headers=HTTP_HEADERS, timeout=5)
-        if res.status_code == 200:
-            ranks = res.json().get("data", {}).get("ranks", [])
-            for r in ranks:
-                user = r.get("user", {})
-                uname = user.get("display_id") or user.get("unique_id")
-                if uname:
-                    viewers.add(str(uname).lower().strip().lstrip("@"))
-    except Exception:
-        pass
+                # 1. Tamu / Komal / Link-Mic
+                link_mic = data.get("link_mic", {})
+                linked_users = link_mic.get("linked_user_list", []) or []
+                for u in linked_users:
+                    uname = u.get("display_id") or u.get("unique_id") or u.get("nickname")
+                    if uname:
+                        guests.add(str(uname).lower().strip().lstrip("@"))
+
+                for u in link_mic.get("show_user_list", []) or []:
+                    uname = u.get("display_id") or u.get("unique_id")
+                    if uname:
+                        guests.add(str(uname).lower().strip().lstrip("@"))
+
+                # 2. Penonton / Top Fans
+                top_fans = data.get("top_fans", []) or []
+                for f in top_fans:
+                    u = f.get("user", {}) if isinstance(f.get("user"), dict) else f
+                    uname = u.get("display_id") or u.get("unique_id")
+                    if uname:
+                        viewers.add(str(uname).lower().strip().lstrip("@"))
+    except Exception as e:
+        logger.debug("Error fetch_room_participants room %s: %s", room_id, str(e))
 
     return guests, viewers
 
 
 def fetch_targets_and_hosts() -> Tuple[List[Dict], List[Dict]]:
     """Mengambil daftar targets dan hosts dari database Supabase."""
-    targets_res = supabase.table("targets").select("id, username, display_name").execute()
-    hosts_res = supabase.table("hosts").select("id, username, display_name").execute()
-
-    targets = targets_res.data or []
-    hosts = hosts_res.data or []
+    targets = supabase.get("targets?select=id,username,display_name")
+    hosts = supabase.get("hosts?select=id,username,display_name")
     return targets, hosts
 
 
 def get_latest_logged_status(target_username: str) -> Optional[Dict]:
     """Mengambil log terakhir dari target untuk membandingkan perubahan status."""
-    res = supabase.table("activity_logs") \
-        .select("status, host_username, timestamp") \
-        .eq("target_username", target_username) \
-        .order("timestamp", desc=True) \
-        .limit(1) \
-        .execute()
-    
-    if res.data and len(res.data) > 0:
-        return res.data[0]
+    clean = target_username.strip().lstrip("@").lower()
+    logs = supabase.get(f"activity_logs?select=status,host_username,timestamp&target_username=eq.{clean}&order=timestamp.desc&limit=1")
+    if logs and len(logs) > 0:
+        return logs[0]
     return None
 
 
@@ -189,47 +295,62 @@ def run_checker():
     logger.info("Memulai siklus pengecekan TikTok Activity Tracker...")
     
     targets, hosts = fetch_targets_and_hosts()
-    logger.info("Ditemukan %d target dan %d host terdaftar.", len(targets), len(hosts))
+    logger.info("Ditemukan %d target dan %d host terdaftar di Supabase.", len(targets), len(hosts))
 
     if not targets:
         logger.info("Tidak ada target yang dipantau. Selesai.")
         return
 
-    # Kumpulkan peta target untuk pencarian cepat (case-insensitive)
     target_map: Dict[str, Dict] = {
         t["username"].strip().lower().lstrip("@"): t for t in targets
     }
     
-    # State deteksi sementara: target_username -> (status, host_username)
     detected_state: Dict[str, Tuple[str, Optional[str]]] = {}
 
     # 1. Cek apakah ada Target yang sedang LIVE_HOST sendiri
     for uname, target_data in target_map.items():
         room_data = get_live_room_data(uname)
-        if room_data:
+        if room_data and room_data.get("is_live"):
             detected_state[uname] = ("LIVE_HOST", uname)
             logger.info("Target @%s terdeteksi sedang LIVE_HOST!", uname)
+            
+        # Update profil display_name / avatar jika ada
+        if room_data and room_data.get("nickname"):
+            try:
+                update_fields = {"display_name": room_data["nickname"]}
+                if room_data.get("avatar"):
+                    update_fields["avatar_url"] = room_data["avatar"]
+                supabase.patch(f"targets?username=eq.{target_data['username']}", update_fields)
+            except Exception:
+                pass
+        time.sleep(0.3)
 
     # 2. Cek semua Host yang sedang Live dan periksa keberadaan Target di room mereka
     for h in hosts:
         host_uname = h["username"].strip().lower().lstrip("@")
         room_data = get_live_room_data(host_uname)
 
-        if not room_data:
+        if not room_data or not room_data.get("is_live"):
             continue
 
         logger.info("Host @%s sedang LIVE aktif.", host_uname)
         
-        # Jika host ini juga merupakan salah satu target kita
         if host_uname in target_map and host_uname not in detected_state:
             detected_state[host_uname] = ("LIVE_HOST", host_uname)
 
-        room_id = str(room_data.get("roomId") or room_data.get("room_id") or "")
-        anchor_id = str(room_data.get("ownerInfo", {}).get("uid") or "")
-        
-        guests, viewers = fetch_room_participants(room_id, anchor_id)
+        if room_data.get("nickname"):
+            try:
+                update_fields = {"display_name": room_data["nickname"]}
+                if room_data.get("avatar"):
+                    update_fields["avatar_url"] = room_data["avatar"]
+                supabase.patch(f"hosts?username=eq.{h['username']}", update_fields)
+            except Exception:
+                pass
 
-        # Cek apakah target ada di daftar Tamu atau Penonton room host ini
+        room_id = str(room_data.get("room_id") or "")
+        guests, viewers = fetch_room_participants(room_id, host_uname)
+        time.sleep(0.3)
+
         for uname in target_map.keys():
             if uname in detected_state and detected_state[uname][0] == "LIVE_HOST":
                 continue
@@ -269,7 +390,6 @@ def run_checker():
             }
             new_logs_to_insert.append(log_item)
 
-            # Format pesan notifikasi human-readable
             time_str = datetime.now().strftime("%H:%M")
             if status == "LIVE_HOST":
                 msg = f"{display_name} (@{raw_target_username}) memulai Live Streaming sendiri - {time_str}"
@@ -287,27 +407,24 @@ def run_checker():
             logger.info("Perubahan status: %s", msg)
             send_free_push_notification(title, msg)
 
-    # Simpan batch logs baru jika ada
     if new_logs_to_insert:
-        supabase.table("activity_logs").insert(new_logs_to_insert).execute()
+        supabase.post("activity_logs", new_logs_to_insert)
         logger.info("Berhasil menyimpan %d log aktivitas baru ke Supabase.", len(new_logs_to_insert))
     else:
-        logger.info("Tidak ada perubahan status pada target. Database tetap teratur.")
+        logger.info("Tidak ada perubahan status pada target. Database sinkron.")
 
-    # 5. Update bot heartbeat untuk status koneksi di APK
+    # 5. Update bot heartbeat
     try:
-        heartbeat_payload = {
-            "id": "checker_worker",
+        heartbeat_payload = [{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "bot_name": "tiktok_checker",
             "last_ping": datetime.now(timezone.utc).isoformat(),
-            "status": "ACTIVE",
-            "targets_checked": len(targets),
-            "hosts_checked": len(hosts),
-            "details": f"Checked {len(targets)} targets and {len(hosts)} hosts at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        }
-        supabase.table("bot_heartbeat").upsert(heartbeat_payload).execute()
+            "status": "ACTIVE"
+        }]
+        supabase.post("bot_heartbeat", heartbeat_payload, upsert=True)
         logger.info("Heartbeat bot berhasil diperbarui ke Supabase.")
     except Exception as hb_err:
-        logger.debug("Heartbeat optional info (tabel bot_heartbeat belum dibuat): %s", str(hb_err))
+        logger.debug("Heartbeat info: %s", str(hb_err))
 
     logger.info("Pengecekan selesai.")
 
