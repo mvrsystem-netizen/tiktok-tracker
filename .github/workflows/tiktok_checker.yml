@@ -2,9 +2,9 @@ name: TikTok Live Activity Background Checker
 
 on:
   schedule:
-    # Berjalan otomatis setiap 5 menit (gratis tanpa henti di GitHub Actions)
+    # Berjalan otomatis setiap 5 menit (interval minimum di GitHub Actions)
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Tombol manual trigger di tab Actions GitHub
+  workflow_dispatch: # Tombol manual trigger di tab Actions GitHub (Run workflow)
 
 jobs:
   check-tiktok-activity:
@@ -29,8 +29,8 @@ jobs:
       - name: Run TikTok Activity Checker
         env:
           # Disimpan aman di GitHub Repository Secrets (Settings -> Secrets and variables -> Actions)
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL || 'https://kxdiqgjeqjrlvxwscavy.supabase.co' }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt4ZGlxZ2plcWpybHZ4d3NjYXZ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk1NzUwMzIsImV4cCI6MjEwNTE1MTAzMn0.DeYH7w_fx9XQIpTx5IJccJBFKPOmlccloWbscpuD1eU' }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
